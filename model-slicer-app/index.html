@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <title>Mesh Cutter - Exact Length Limit</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background: #111214; color: #dbdee1; display: flex; justify-content: center; padding: 40px; }
+        .card { background: #1e1f22; padding: 30px; border-radius: 12px; width: 480px; border: 1px solid #2f3136; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        .input-group { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+        input[type="number"] { background: #111214; border: 1px solid #4e5058; color: white; padding: 8px; width: 70px; border-radius: 4px; text-align: center; }
+        button { width: 100%; background: #5865f2; color: white; border: none; padding: 16px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 16px; }
+        .status { text-align: center; margin-top: 15px; font-weight: bold; color: #57f287; }
+        .warning { color: #f2a357; font-size: 12px; margin-bottom: 10px; text-align: center; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2 style="text-align:center; margin-top:0">Step-Back Cutter (Limit)</h2>
+    <div class="warning">จะหยุดหั่นทันทีเมื่อถึงจุดต่ำสุดของโมเดล</div>
+    
+    <input type="file" id="fileIn" accept=".bbmodel" style="margin-bottom:20px; width:100%">
+    
+    <div class="input-group">
+        <span>Size Y ชุดที่ 1 (เช่น 3.0)</span>
+        <input type="number" id="size1" value="3.0" step="0.1">
+    </div>
+    <div class="input-group">
+        <span>Size Y ชุดที่ 2 (เช่น 2.7)</span>
+        <input type="number" id="size2" value="2.7" step="0.1">
+    </div>
+    <div class="input-group">
+        <span>ระยะซ้อนทับ (Overlap)</span>
+        <input type="number" id="overlap" value="0.3" step="0.1">
+    </div>
+
+    <button id="execBtn">หั่นโมเดล (จำกัดจำนวนชิ้น)</button>
+    <div id="status" class="status"></div>
+</div>
+
+<script>
+    document.getElementById('execBtn').onclick = async () => {
+        const file = document.getElementById('fileIn').files[0];
+        if (!file) return;
+
+        const sizes = [
+            parseFloat(document.getElementById('size1').value),
+            parseFloat(document.getElementById('size2').value)
+        ];
+        const stepBack = parseFloat(document.getElementById('overlap').value);
+
+        try {
+            const data = JSON.parse(await file.text());
+            let newElements = [];
+            let allUUIDs = [];
+
+            data.elements.forEach((el) => {
+                if (el.type === "mesh") {
+                    const vYs = Object.values(el.vertices).map(v => v[1]);
+                    const minY = Math.min(...vYs);
+                    const maxY = Math.max(...vYs);
+                    const totalH = maxY - minY;
+
+                    let currentTop = maxY;
+                    let stepCount = 0;
+
+                    // วนลูปจนกว่าจะถึงพื้น (minY)
+                    // เพิ่มระยะเผื่อ 0.1 เพื่อไม่ให้หั่นเศษจิ๋วที่ปลายโมเดล
+                    while (currentTop > minY + 0.5) {
+                        let targetSize = sizes[stepCount % 2];
+                        let nextBottom = Math.max(currentTop - targetSize, minY);
+                        
+                        let slice = JSON.parse(JSON.stringify(el));
+                        const sliceUUID = self.crypto.randomUUID();
+                        slice.uuid = sliceUUID;
+                        slice.name = `LB1H${stepCount + 1}`;
+
+                        // ตัด Vertex
+                        for (let vId in slice.vertices) {
+                            let y = slice.vertices[vId][1];
+                            if (y > currentTop) slice.vertices[vId][1] = currentTop;
+                            else if (y < nextBottom) slice.vertices[vId][1] = nextBottom;
+                        }
+
+                        // คำนวณ UV
+                        const uvStartRatio = (nextBottom - minY) / (totalH || 1);
+                        const uvEndRatio = (currentTop - minY) / (totalH || 1);
+                        for (let fId in slice.faces) {
+                            let face = slice.faces[fId];
+                            if (face.uv) {
+                                let vCoords = Object.values(face.uv).map(u => u[1]);
+                                let minV = Math.min(...vCoords);
+                                let maxV = Math.max(...vCoords);
+                                let vRange = maxV - minV;
+                                Object.keys(face.uv).forEach(key => {
+                                    let originalV = el.faces[fId].uv[key][1];
+                                    let relV = (originalV - minV) / (vRange || 1);
+                                    let flippedVStart = maxV - (uvEndRatio * vRange);
+                                    let flippedVEnd = maxV - (uvStartRatio * vRange);
+                                    face.uv[key][1] = flippedVStart + (relV * (flippedVEnd - flippedVStart));
+                                });
+                            }
+                        }
+
+                        newElements.push(slice);
+                        allUUIDs.push(sliceUUID);
+
+                        // เลื่อนตำแหน่งลง: (เป้าหมาย - ระยะซ้อนทับ)
+                        currentTop = nextBottom + stepBack; 
+                        
+                        // เช็คกัน Loop Infinity หรือหั่นเพลิน
+                        stepCount++;
+                        if (stepCount > 100) break; 
+                        
+                        // ถ้าจุดเริ่มใหม่ (currentTop) มันต่ำกว่าพื้น หรือเท่ากับจุดเดิม ให้หยุด
+                        if (currentTop <= minY || currentTop >= maxY && stepCount > 1) break;
+                    }
+                } else {
+                    newElements.push(el);
+                }
+            });
+
+            data.outliner = [{
+                name: "Hair_Group",
+                origin: [0, 0, 0],
+                uuid: self.crypto.randomUUID(),
+                export: true, isOpen: true, children: allUUIDs
+            }];
+            data.elements = newElements;
+
+            const blob = new Blob([JSON.stringify(data)], {type: "application/json"});
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = `Cutter_Limited.bbmodel`;
+            a.click();
+            document.getElementById('status').innerText = `✅ หั่นเสร็จสิ้น! รวม ${allUUIDs.length} ชิ้น`;
+        } catch (e) { console.error(e); }
+    };
+</script>
+</body>
+</html>
